@@ -7,10 +7,22 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      CROSS_COMPILE_ARM32: arm-linux-gnueabi-
+      LLVM: "1"
+      LLVM_IAS: "1"
+
     steps:
-      - name: Install dependencies
+
+      # ---------------------------------------------------------
+      # BUILD DEPENDENCIES
+      # ---------------------------------------------------------
+      - name: Install build dependencies
         run: |
           sudo apt-get update
+
           sudo apt-get install -y \
             git \
             bc \
@@ -19,15 +31,27 @@ jobs:
             build-essential \
             libssl-dev \
             libelf-dev \
+            libdw-dev \
             clang \
             llvm \
             lld \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
+            gcc-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi \
             python3 \
             cpio \
-            rsync
+            rsync \
+            kmod
 
+          echo "Toolchain versions:"
+          clang --version
+          aarch64-linux-gnu-gcc --version
+          arm-linux-gnueabi-gcc --version
+
+      # ---------------------------------------------------------
+      # KERNEL SOURCE
+      # ---------------------------------------------------------
       - name: Clone kernel source
         run: |
           git clone \
@@ -36,70 +60,116 @@ jobs:
             https://github.com/LineageOS/android_kernel_samsung_sdm429.git \
             kernel
 
-      - name: Show kernel source
+      - name: Check kernel source
         working-directory: kernel
         run: |
+          echo "Kernel commit:"
           git log -1 --oneline
-          echo
-          echo "Available gtowifi config:"
-          ls -l arch/arm64/configs/lineageos_gtowifi_defconfig
 
-      - name: Configure kernel
+          echo
+          echo "Kernel branch:"
+          git branch --show-current
+
+          echo
+          echo "Checking gtowifi defconfig:"
+          test -f arch/arm64/configs/lineageos_gtowifi_defconfig
+
+          echo "lineageos_gtowifi_defconfig found."
+
+      # ---------------------------------------------------------
+      # CONFIGURE KERNEL
+      # ---------------------------------------------------------
+      - name: Configure gtowifi kernel
         working-directory: kernel
         run: |
           make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
             lineageos_gtowifi_defconfig
 
-      - name: Check kernel configuration
+      - name: Verify kernel configuration
         working-directory: kernel
         run: |
-          echo "Kernel version:"
-          make -s \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            kernelversion
+          echo "========================================"
+          echo "Kernel configuration"
+          echo "========================================"
 
-          echo
-          echo "Module configuration:"
           grep -E \
-            'CONFIG_(LOCALVERSION|MODULES|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|MODULE_SIG_ALL|MODULE_SIG_SHA512)' \
+            'CONFIG_(LOCALVERSION|MODULES|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|MODULE_SIG_ALL|MODULE_SIG_SHA512|MODULE_SIG_HASH)' \
             .config || true
 
+          echo
+          echo "========================================"
+          echo "Kernel version"
+          echo "========================================"
+
+          make -s \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
+            kernelversion
+
+      # ---------------------------------------------------------
+      # PREPARE KERNEL
+      # ---------------------------------------------------------
       - name: Prepare kernel
         working-directory: kernel
         run: |
           make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
             olddefconfig
 
           make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
             prepare \
             modules_prepare
 
-      - name: Build kernel symbol information
+      # ---------------------------------------------------------
+      # BUILD KERNEL SYMBOLS
+      #
+      # CONFIG_MODVERSIONS=y requires Module.symvers.
+      #
+      # We build the kernel sufficiently to generate the symbol
+      # version information used by external modules.
+      # ---------------------------------------------------------
+      - name: Build kernel for Module.symvers
         working-directory: kernel
         run: |
           make \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
             -j"$(nproc)" \
             vmlinux
 
+      - name: Check Module.symvers
+        working-directory: kernel
+        run: |
+          echo "Module.symvers:"
+          ls -lh Module.symvers
+
+          echo
+          echo "Number of exported symbols:"
+          wc -l Module.symvers
+
+      # ---------------------------------------------------------
+      # RTL8821AU DRIVER
+      # ---------------------------------------------------------
       - name: Clone RTL8821AU driver
         run: |
           git clone \
@@ -107,38 +177,63 @@ jobs:
             https://github.com/ruhyadi/tplink-archer-t2u-plus-driver.git \
             driver
 
-      - name: Show driver source
+      - name: Check driver source
         working-directory: driver
         run: |
+          echo "Driver commit:"
           git log -1 --oneline
-          echo
-          find . -maxdepth 2 -type f | head -50
 
+          echo
+          echo "Driver files:"
+          find . -maxdepth 2 -type f | head -100
+
+      # ---------------------------------------------------------
+      # BUILD MODULE
+      # ---------------------------------------------------------
       - name: Build RTL8821AU module
         run: |
           make \
             -C "$GITHUB_WORKSPACE/kernel" \
-            ARCH=arm64 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            LLVM=1 \
-            LLVM_IAS=1 \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
             M="$GITHUB_WORKSPACE/driver" \
             modules
 
-      - name: Inspect module
+      # ---------------------------------------------------------
+      # INSPECT RESULT
+      # ---------------------------------------------------------
+      - name: Inspect generated module
         run: |
-          echo "Generated modules:"
-          find driver -type f -name '*.ko' -print
+          echo "========================================"
+          echo "Generated .ko files"
+          echo "========================================"
 
-          MODULE="$(find driver -type f -name '*.ko' | head -n 1)"
+          find "$GITHUB_WORKSPACE/driver" \
+            -type f \
+            -name "*.ko" \
+            -print
+
+          MODULE="$(find "$GITHUB_WORKSPACE/driver" \
+            -type f \
+            -name "*.ko" \
+            | head -n 1)"
 
           if [ -z "$MODULE" ]; then
-            echo "ERROR: No kernel module was produced."
+            echo
+            echo "ERROR: No kernel module was generated."
             exit 1
           fi
 
           echo
-          echo "Module:"
+          echo "========================================"
+          echo "Module information"
+          echo "========================================"
+
+          echo "Module: $MODULE"
+
           file "$MODULE"
 
           echo
@@ -149,26 +244,72 @@ jobs:
           echo "vermagic:"
           modinfo -F vermagic "$MODULE" || true
 
-      - name: Prepare artifact
+          echo
+          echo "Kernel:"
+          make -s \
+            -C "$GITHUB_WORKSPACE/kernel" \
+            ARCH="${ARCH}" \
+            CROSS_COMPILE="${CROSS_COMPILE}" \
+            CROSS_COMPILE_ARM32="${CROSS_COMPILE_ARM32}" \
+            LLVM="${LLVM}" \
+            LLVM_IAS="${LLVM_IAS}" \
+            kernelversion
+
+      # ---------------------------------------------------------
+      # CHECK MODULE SIGNATURE
+      # ---------------------------------------------------------
+      - name: Check module signature
         run: |
-          mkdir -p output
-
-          find driver \
+          MODULE="$(find "$GITHUB_WORKSPACE/driver" \
             -type f \
-            -name '*.ko' \
-            -exec cp {} output/ \;
+            -name "*.ko" \
+            | head -n 1)"
 
-          cp kernel/.config output/kernel.config
+          echo "Checking signature information..."
 
-          if [ -f kernel/Module.symvers ]; then
-            cp kernel/Module.symvers output/Module.symvers
-          fi
+          modinfo "$MODULE" 2>/dev/null | \
+            grep -E '^(signer|sig_id|sig_key|sig_hashalgo):' \
+            || true
 
           echo
-          echo "Final artifact:"
+          echo "Kernel signing configuration:"
+
+          grep -E \
+            'CONFIG_MODULE_SIG|CONFIG_MODULE_SIG_FORCE|CONFIG_MODULE_SIG_SHA512' \
+            "$GITHUB_WORKSPACE/kernel/.config" \
+            || true
+
+      # ---------------------------------------------------------
+      # PACKAGE ARTIFACT
+      # ---------------------------------------------------------
+      - name: Package output
+        run: |
+          rm -rf output
+          mkdir -p output
+
+          find "$GITHUB_WORKSPACE/driver" \
+            -type f \
+            -name "*.ko" \
+            -exec cp {} output/ \;
+
+          cp "$GITHUB_WORKSPACE/kernel/.config" \
+            output/kernel.config
+
+          if [ -f "$GITHUB_WORKSPACE/kernel/Module.symvers" ]; then
+            cp "$GITHUB_WORKSPACE/kernel/Module.symvers" \
+              output/Module.symvers
+          fi
+
+          echo "========================================"
+          echo "Final files"
+          echo "========================================"
+
           ls -lh output/
 
-      - name: Upload module
+      # ---------------------------------------------------------
+      # UPLOAD ARTIFACT
+      # ---------------------------------------------------------
+      - name: Upload kernel module
         uses: actions/upload-artifact@v4
         with:
           name: gtowifi-rtl8821au
