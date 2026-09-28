@@ -1,78 +1,176 @@
-name: Build postmarketOS flashable ZIP
+name: Build RTL8821AU for gtowifi
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 0'
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    
+    runs-on: ubuntu-22.04
+
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-    
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          git python3 python3-pip openssl \
-          libssl-dev libtool autoconf automake \
-          build-essential
-    
-    - name: Install pmbootstrap from git
-      run: |
-        pip3 install --upgrade pip
-        pip3 install git+https://git.sr.ht/~postmarketos/pmbootstrap
-    
-    - name: Verify pmbootstrap installation
-      run: |
-        pmbootstrap --version
-    
-    - name: Initialize pmbootstrap config
-      run: |
-        mkdir -p ~/.config
-        cat > ~/.config/pmbootstrap.cfg << EOF
-        [main]
-        aports_upstream_url = https://gitlab.com/postmarketOS/pmaports
-        device = samsung-gtowifi
-        hostname = pmos
-        keymap = us
-        locale = en_US.UTF-8
-        work = ~/.local/var/pmbootstrap
-        EOF
-    
-    - name: Build flashable ZIP
-      run: |
-        pmbootstrap -y install --android-recovery-zip --password=test123
-      timeout-minutes: 120
-    
-    - name: Export built images
-      run: |
-        mkdir -p build-output
-        pmbootstrap export
-        if [ -d ~/.local/var/pmbootstrap/chroot_native/tmp/postmarketOS-export ]; then
-          cp ~/.local/var/pmbootstrap/chroot_native/tmp/postmarketOS-export/* build-output/ 2>/dev/null || true
-        fi
-        ls -lah build-output/
-    
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: postmarketos-flashable-zip
-        path: build-output/
-        retention-days: 30
-    
-    - name: Create Release (on push to main)
-      if: github.event_name == 'push' && success()
-      uses: softprops/action-gh-release@v1
-      with:
-        files: build-output/*.zip
-        tag_name: build-${{ github.run_number }}
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            libssl-dev \
+            libelf-dev \
+            clang \
+            llvm \
+            lld \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            python3 \
+            cpio \
+            rsync
+
+      - name: Clone kernel source
+        run: |
+          git clone \
+            --branch lineage-22.2 \
+            --depth=1 \
+            https://github.com/LineageOS/android_kernel_samsung_sdm429.git \
+            kernel
+
+      - name: Show kernel source
+        working-directory: kernel
+        run: |
+          git log -1 --oneline
+          echo
+          echo "Available gtowifi config:"
+          ls -l arch/arm64/configs/lineageos_gtowifi_defconfig
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            lineageos_gtowifi_defconfig
+
+      - name: Check kernel configuration
+        working-directory: kernel
+        run: |
+          echo "Kernel version:"
+          make -s \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            kernelversion
+
+          echo
+          echo "Module configuration:"
+          grep -E \
+            'CONFIG_(LOCALVERSION|MODULES|MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|MODULE_SIG_ALL|MODULE_SIG_SHA512)' \
+            .config || true
+
+      - name: Prepare kernel
+        working-directory: kernel
+        run: |
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            olddefconfig
+
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            prepare \
+            modules_prepare
+
+      - name: Build kernel symbol information
+        working-directory: kernel
+        run: |
+          make \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            -j"$(nproc)" \
+            vmlinux
+
+      - name: Clone RTL8821AU driver
+        run: |
+          git clone \
+            --depth=1 \
+            https://github.com/ruhyadi/tplink-archer-t2u-plus-driver.git \
+            driver
+
+      - name: Show driver source
+        working-directory: driver
+        run: |
+          git log -1 --oneline
+          echo
+          find . -maxdepth 2 -type f | head -50
+
+      - name: Build RTL8821AU module
+        run: |
+          make \
+            -C "$GITHUB_WORKSPACE/kernel" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            M="$GITHUB_WORKSPACE/driver" \
+            modules
+
+      - name: Inspect module
+        run: |
+          echo "Generated modules:"
+          find driver -type f -name '*.ko' -print
+
+          MODULE="$(find driver -type f -name '*.ko' | head -n 1)"
+
+          if [ -z "$MODULE" ]; then
+            echo "ERROR: No kernel module was produced."
+            exit 1
+          fi
+
+          echo
+          echo "Module:"
+          file "$MODULE"
+
+          echo
+          echo "modinfo:"
+          modinfo "$MODULE" || true
+
+          echo
+          echo "vermagic:"
+          modinfo -F vermagic "$MODULE" || true
+
+      - name: Prepare artifact
+        run: |
+          mkdir -p output
+
+          find driver \
+            -type f \
+            -name '*.ko' \
+            -exec cp {} output/ \;
+
+          cp kernel/.config output/kernel.config
+
+          if [ -f kernel/Module.symvers ]; then
+            cp kernel/Module.symvers output/Module.symvers
+          fi
+
+          echo
+          echo "Final artifact:"
+          ls -lh output/
+
+      - name: Upload module
+        uses: actions/upload-artifact@v4
+        with:
+          name: gtowifi-rtl8821au
+          path: output/
+          if-no-files-found: error
